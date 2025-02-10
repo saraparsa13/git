@@ -9,24 +9,19 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-fn construct_blob_path(hash: &str) -> String {
+fn construct_path(hash: &str) -> String {
     assert!(hash.len() == 40, "Invalid hash length");
-
     let (dir, file) = hash.split_at(2);
     format!(".git/objects/{}/{}", dir, file)
 }
 
 fn decompress_blob(blob_path: &str) -> io::Result<String> {
     let file = File::open(blob_path)?;
-
     let mut decoder = ZlibDecoder::new(file);
     let mut decompressed_data = String::new();
-
     decoder.read_to_string(&mut decompressed_data)?;
-
     if let Some(null_index) = decompressed_data.find('\0') {
-        let content = &decompressed_data[null_index + 1..];
-        Ok(content.to_string())
+        Ok(decompressed_data[null_index + 1..].to_string())
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -36,8 +31,7 @@ fn decompress_blob(blob_path: &str) -> io::Result<String> {
 }
 
 fn read_blob_file(hash: &str) {
-    let blob_path = construct_blob_path(hash);
-
+    let blob_path = construct_path(hash);
     if Path::new(&blob_path).exists() {
         match decompress_blob(&blob_path) {
             Ok(content) => print!("{}", content),
@@ -50,7 +44,6 @@ fn read_blob_file(hash: &str) {
 
 fn create_blob_file(filename: &str) -> io::Result<String> {
     let content = fs::read(filename)?;
-
     let header = format!("blob {}\0", content.len());
     let mut full_content = Vec::new();
     full_content.extend_from_slice(header.as_bytes());
@@ -75,9 +68,111 @@ fn create_blob_file(filename: &str) -> io::Result<String> {
     Ok(hash_hex)
 }
 
+#[derive(Debug)]
+struct TreeEntry {
+    mode: String,
+    sha: String,
+    name: String,
+}
+
+fn parse_tree_entries(hash: &str) -> io::Result<Vec<TreeEntry>> {
+    let tree_path = construct_path(hash);
+    if !Path::new(&tree_path).exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("tree path not found: {}", tree_path),
+        ));
+    }
+
+    let file = File::open(&tree_path)?;
+    let mut decoder = ZlibDecoder::new(file);
+    let mut decoded_data: Vec<u8> = Vec::new();
+    decoder.read_to_end(&mut decoded_data)?;
+
+    let header_end = decoded_data.iter().position(|&b| b == 0).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid tree object: missing header null byte",
+        )
+    })? + 1;
+    let mut pos = header_end;
+    let mut entries = Vec::new();
+
+    while pos < decoded_data.len() {
+        let space_pos = decoded_data[pos..]
+            .iter()
+            .position(|&b| b == b' ')
+            .map(|p| p + pos)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid tree object: missing space in entry",
+                )
+            })?;
+        let mode = std::str::from_utf8(&decoded_data[pos..space_pos])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            .to_string();
+
+        pos = space_pos + 1;
+
+        let null_pos = decoded_data[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| p + pos)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid tree object: missing null byte after filename",
+                )
+            })?;
+        let name = std::str::from_utf8(&decoded_data[pos..null_pos])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            .to_string();
+
+        pos = null_pos + 1;
+
+        if pos + 20 > decoded_data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Unexpected end of tree entry data",
+            ));
+        }
+        
+        let sha_bytes = &decoded_data[pos..pos + 20];
+        let sha = sha_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+
+        pos += 20;
+
+        entries.push(TreeEntry { mode, sha, name });
+    }
+    Ok(entries)
+}
+
+fn print_tree(hash: &str) -> io::Result<()> {
+    let entries = parse_tree_entries(hash)?;
+    for entry in entries {
+        match entry.mode.as_str() {
+            "40000" => println!("040000 tree {} {}", entry.sha, entry.name),
+            "100644" => println!("100644 blob {} {}", entry.sha, entry.name),
+            _ => println!("{} {} {}", entry.mode, entry.sha, entry.name),
+        }
+    }
+    Ok(())
+}
+
+fn print_tree_names(hash: &str) -> io::Result<()> {
+    let entries = parse_tree_entries(hash)?;
+    for entry in entries {
+        println!("{}", entry.name);
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
-
     if args.len() < 2 {
         eprintln!("Error: Missing command");
         return;
@@ -97,6 +192,19 @@ fn main() {
         },
         "cat-file" if args.len() == 4 && args[2] == "-p" => {
             read_blob_file(&args[3]);
+        }
+        "ls-tree" => {
+            if args.len() == 3 {
+                if let Err(e) = print_tree(&args[2]) {
+                    eprintln!("Error: {}", e);
+                }
+            } else if args.len() == 4 {
+                if args[2] == "--name-only" {
+                    if let Err(e) = print_tree_names(&args[3]) {
+                        eprintln!("Error: {}", e);
+                    }
+                }
+            }
         }
         _ => eprintln!("Unknown command: {:?}", args),
     }
